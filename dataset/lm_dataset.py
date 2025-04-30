@@ -19,6 +19,10 @@ class PretrainDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = self.load_data(data_path)
+        self.eos_token = '<|im_end|>'
+        self.pad_token = '<|endoftext|>'
+        self.eos_token_id = tokenizer.convert_tokens_to_ids(self.eos_token)
+        self.pad_token_id = tokenizer.convert_tokens_to_ids(self.pad_token)
 
     def load_data(self, path):
         samples = []
@@ -34,20 +38,21 @@ class PretrainDataset(Dataset):
     def __getitem__(self, index):
         sample = self.samples[index]
 
-        # 构建输入文本
+        #! 构建输入文本, 末尾加上eos_token
+        text = str(sample['text']) + self.eos_token
         encoding = self.tokenizer(
-            str(sample['text']),
+            text,
             max_length=self.max_length,
             padding='max_length',
             truncation=True,
             return_tensors='pt'
         )
         input_ids = encoding.input_ids.squeeze()
-        loss_mask = (input_ids != self.tokenizer.pad_token_id)
+        loss_mask = (input_ids != self.pad_token_id)
 
-        X = torch.tensor(input_ids[:-1], dtype=torch.long)
-        Y = torch.tensor(input_ids[1:], dtype=torch.long)
-        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
+        X = input_ids[:-1]
+        Y = input_ids[1:]
+        loss_mask = loss_mask[1:]
         return X, Y, loss_mask
 
 
@@ -201,8 +206,10 @@ class RLAIFDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = self.load_data(jsonl_path)
-        self.bos_id = tokenizer('<|im_start|>assistant', add_special_tokens=False).input_ids
-        self.eos_id = tokenizer('<|im_end|>', add_special_tokens=False).input_ids
+        self.bos_id =  '<|im_end|>'
+        self.eos_id = '<|endoftext|>'
+        self.eos_token_id = tokenizer.convert_tokens_to_ids(self.eos_token)
+        self.pad_token_id = tokenizer.convert_tokens_to_ids(self.pad_token)
 
     def __len__(self):
         return len(self.samples)

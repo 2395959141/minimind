@@ -19,6 +19,9 @@ from dataset.lm_dataset import PretrainDataset
 
 warnings.filterwarnings('ignore')
 
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+
 
 def Logger(content):
     if not ddp or dist.get_rank() == 0:
@@ -27,6 +30,67 @@ def Logger(content):
 
 def get_lr(current_step, total_steps, lr):
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
+
+
+def init_pretrain_model(args):
+    tokenizer = AutoTokenizer.from_pretrained('./model/')
+    ckp = f'/home/yuhang/out/pretrain_768.pth'
+
+    model = MiniMindForCausalLM(MiniMindConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        use_moe=args.use_moe
+    ))
+
+    model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
+
+    print(f'MiniMind模型参数量: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M(illion)')
+    return model.eval().to(args.device), tokenizer
+
+
+
+
+def test_model_on_prompts(model, tokenizer, device, max_seq_len=80):
+    prompts = [
+        '马克思主义基本原理',
+        '人类大脑的主要功能',
+        '万有引力原理是',
+        '世界上最高的山峰是',
+    ]
+    # init_pretrain_model(args)  # 建议删除
+    model.eval()
+    # 关键修正：兼容 DDP
+    if hasattr(model, "module"):
+        gen_model = model.module
+    else:
+        gen_model = model
+    for prompt in prompts:
+        input_text = (tokenizer.bos_token or "") + prompt
+        inputs = tokenizer(
+            input_text,
+            return_tensors="pt",
+            truncation=True
+        ).to(device)
+        with torch.no_grad():
+            generated_ids = gen_model.generate(
+                inputs["input_ids"],
+                max_new_tokens=max_seq_len,
+                num_return_sequences=1,
+                do_sample=True,
+                attention_mask=inputs["attention_mask"],
+                pad_token_id=tokenizer.pad_token_id,
+                top_p=0.85,
+                repetition_penalty=1.05,
+                temperature=0.85,
+                bos_token_id=151643,
+                eos_token_id=[
+                    tokenizer.convert_tokens_to_ids('<|im_end|>'),
+                    tokenizer.convert_tokens_to_ids('<|endoftext|>')
+                ] if hasattr(tokenizer, 'convert_tokens_to_ids') else tokenizer.eos_token_id,
+            )
+            response = tokenizer.decode(generated_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            print(f"\n[测试] 输入: {prompt}\n[测试] 输出: {response}\n")
+    model.train()
 
 
 def train_epoch(epoch, wandb):
@@ -79,6 +143,11 @@ def train_epoch(epoch, wandb):
                            "lr": optimizer.param_groups[-1]['lr'],
                            "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
 
+        # 新增：每1000 step进行一次模型测试
+        if (step + 1) % 5000 == 0 and (not ddp or dist.get_rank() == 0):
+            print(f"\n[测试] 当前step: {step+1}，进行模型推理测试：")
+            test_model_on_prompts(model, tokenizer, args.device, max_seq_len=80)
+
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
             model.eval()
             moe_path = '_moe' if lm_config.use_moe else ''
@@ -94,9 +163,13 @@ def train_epoch(epoch, wandb):
             model.train()
 
 
-def init_model(lm_config):
-    tokenizer = AutoTokenizer.from_pretrained('./model/')
+def init_model(lm_config, args):
+    if args.use_qwen25_tokenizer:
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+    else:
+        tokenizer = AutoTokenizer.from_pretrained('./model/')
     model = MiniMindForCausalLM(lm_config).to(args.device)
+    print("词嵌入维度", model.config.vocab_size)
     Logger(f'LLM可训练总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     return model, tokenizer
 
@@ -119,26 +192,26 @@ if __name__ == "__main__":
     parser.add_argument("--out_dir", type=str, default="../out")
     # 若要以最快速度实现zero则epochs设置为1轮；否则应当利用有限的数据训练2~6个epochs。
     parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=5e-4)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--use_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain")
+    parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain-Qwen")
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--ddp", action="store_true")
-    parser.add_argument("--accumulation_steps", type=int, default=2)
+    parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_iters", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=100)
-    parser.add_argument("--save_interval", type=int, default=100)
+    parser.add_argument("--save_interval", type=int, default=2000)
     parser.add_argument('--local_rank', type=int, default=-1)
     parser.add_argument('--hidden_size', default=768, type=int)
     parser.add_argument('--num_hidden_layers', default=16, type=int)
     parser.add_argument('--max_seq_len', default=512, type=int)
     parser.add_argument('--use_moe', default=False, type=bool)
     parser.add_argument("--data_path", type=str, default="/data1/yuhang/.cache/pretrain_hq.jsonl")
-    parser.add_argument("--use_qwen25_tokenizer", type=bool, default=False)
+    parser.add_argument("--use_qwen25_tokenizer", type=bool, default=True)
     args = parser.parse_args()
 
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=args.use_moe)
@@ -174,7 +247,9 @@ if __name__ == "__main__":
     else:
         wandb = None
 
-    model, tokenizer = init_model(lm_config)
+    model, tokenizer = init_model(lm_config, args)
+    ## ! 使用torch.compile进行加速
+    # model = torch.compile(model, mode="reduce-overhead")
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if ddp else None
     train_loader = DataLoader(

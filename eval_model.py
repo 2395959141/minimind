@@ -10,11 +10,14 @@ warnings.filterwarnings('ignore')
 
 
 def init_model(args):
-    tokenizer = AutoTokenizer.from_pretrained('./model/')
+    if args.use_qwen25_tokenizer:
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+    else:
+        tokenizer = AutoTokenizer.from_pretrained('./model/')
     if args.load == 0:
         moe_path = '_moe' if args.use_moe else ''
         modes = {0: 'pretrain', 1: 'full_sft', 2: 'rlhf', 3: 'reason', 4: 'grpo'}
-        ckp = f'./{args.out_dir}/{modes[args.model_mode]}_{args.hidden_size}{moe_path}.pth'
+        ckp = f'../{args.out_dir}/{modes[args.model_mode]}_{args.hidden_size}{moe_path}.pth'
 
         model = MiniMindForCausalLM(MiniMindConfig(
             hidden_size=args.hidden_size,
@@ -26,7 +29,7 @@ def init_model(args):
 
         if args.lora_name != 'None':
             apply_lora(model)
-            load_lora(model, f'./{args.out_dir}/lora/{args.lora_name}_{args.hidden_size}.pth')
+            load_lora(model, f'{args.out_dir}/lora/{args.lora_name}_{args.hidden_size}.pth')
     else:
         transformers_model_path = './MiniMind2'
         tokenizer = AutoTokenizer.from_pretrained(transformers_model_path)
@@ -107,9 +110,9 @@ def main():
     # MiniMind2-moe (145M)：(hidden_size=640, num_hidden_layers=8, use_moe=True)
     # MiniMind2-Small (26M)：(hidden_size=512, num_hidden_layers=8)
     # MiniMind2 (104M)：(hidden_size=768, num_hidden_layers=16)
-    parser.add_argument('--hidden_size', default=512, type=int)
-    parser.add_argument('--num_hidden_layers', default=8, type=int)
-    parser.add_argument('--max_seq_len', default=8192, type=int)
+    parser.add_argument('--hidden_size', default=768, type=int)
+    parser.add_argument('--num_hidden_layers', default=16, type=int)
+    parser.add_argument('--max_seq_len', default=80, type=int)
     parser.add_argument('--use_moe', default=False, type=bool)
     # 携带历史对话上下文条数
     # history_cnt需要设为偶数，即【用户问题, 模型回答】为1组；设置为0时，即当前query不携带历史上文
@@ -118,6 +121,7 @@ def main():
     parser.add_argument('--load', default=0, type=int, help="0: 原生torch权重，1: transformers加载")
     parser.add_argument('--model_mode', default=1, type=int,
                         help="0: 预训练模型，1: SFT-Chat模型，2: RLHF-Chat模型，3: Reason模型，4: RLAIF-Chat模型")
+    parser.add_argument("--use_qwen25_tokenizer", type=bool, default=True)
     args = parser.parse_args()
 
     model, tokenizer = init_model(args)
@@ -139,7 +143,7 @@ def main():
             messages,
             tokenize=False,
             add_generation_prompt=True
-        ) if args.model_mode != 0 else (tokenizer.bos_token + prompt)
+        ) if args.model_mode != 0 else ((tokenizer.bos_token or "") + prompt)
 
         inputs = tokenizer(
             new_prompt,
@@ -154,11 +158,15 @@ def main():
             num_return_sequences=1,
             do_sample=True,
             attention_mask=inputs["attention_mask"],
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
             streamer=streamer,
             top_p=args.top_p,
-            temperature=args.temperature
+            temperature=args.temperature,
+            bos_token_id=151643,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=[
+                tokenizer.convert_tokens_to_ids('<|im_end|>'),
+                tokenizer.convert_tokens_to_ids('<|endoftext|>')
+            ],
         )
 
         response = tokenizer.decode(generated_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)

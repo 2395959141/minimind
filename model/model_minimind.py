@@ -36,12 +36,28 @@ class MiniMindConfig(PretrainedConfig):
             aux_loss_alpha: float = 0.1,
             seq_aux: bool = True,
             norm_topk_prob: bool = True,
+            #! 是否使用Qwen2.5的tokenizer
+            use_qwen25_tokenizer: bool = True,  
             **kwargs
     ):
         super().__init__(**kwargs)
+
+        if use_qwen25_tokenizer:
+            # 直接从 tokenizer 里取，保证和预训练完全一致
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+            self.bos_token_id = tokenizer.bos_token_id    # None
+            self.eos_token_id = tokenizer.eos_token_id    # 151643
+            self.vocab_size   = len(tokenizer)            # 151936
+            self.rope_theta   = 10000.0
+        else:
+            # 默认配置
+            self.bos_token_id = 1
+            self.eos_token_id = 2
+            self.vocab_size   = 6400
+            self.rope_theta   = 1e6
+
         self.dropout = dropout
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
         self.hidden_act = hidden_act
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -49,9 +65,9 @@ class MiniMindConfig(PretrainedConfig):
         self.num_attention_heads = num_attention_heads
         self.num_hidden_layers = num_hidden_layers
         self.num_key_value_heads = num_key_value_heads
-        self.vocab_size = vocab_size
+        #self.vocab_size = vocab_size
         self.rms_norm_eps = rms_norm_eps
-        self.rope_theta = rope_theta
+        #self.rope_theta = rope_theta
         self.flash_attn = flash_attn
         ####################################################
         # Here are the specific configurations of MOE
@@ -444,3 +460,44 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.OUT.__setitem__('aux_loss', aux_loss)
         self.OUT.__setitem__('past_key_values', past_kvs)
         return self.OUT
+
+    # def generate(
+    #     self,
+    #     input_ids,
+    #     max_new_tokens=80,
+    #     repetition_penalty=1.05,
+    #     **kwargs
+    # ):
+    #     device = input_ids.device
+    #     generated = input_ids.clone()
+    #     past_key_values = None
+    #     for _ in range(max_new_tokens):
+    #         outputs = self.forward(
+    #             input_ids=generated,
+    #             attention_mask=kwargs.get("attention_mask", None),
+    #             past_key_values=past_key_values,
+    #             use_cache=True,
+    #         )
+    #         logits = outputs.logits[:, -1, :]  # 取最后一个token的logits
+
+    #         # 重复惩罚
+    #         for batch_idx in range(generated.size(0)):
+    #             for token_id in set(generated[batch_idx].tolist()):
+    #                 logits[batch_idx, token_id] /= repetition_penalty
+
+    #         probs = F.softmax(logits, dim=-1)
+    #         next_token = torch.multinomial(probs, num_samples=1)
+    #         generated = torch.cat([generated, next_token], dim=1)
+
+    #         # 终止条件
+    #         eos_token_id = kwargs.get("eos_token_id", self.config.eos_token_id)
+    #         if isinstance(eos_token_id, list):
+    #             if all(any(t.item() in eos_token_id for t in seq) for seq in generated):
+    #                 break
+    #         else:
+    #             if all((seq == eos_token_id).any() for seq in generated):
+    #                 break
+
+    #         past_key_values = outputs.past_key_values
+
+    #     return generated
