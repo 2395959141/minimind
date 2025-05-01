@@ -19,8 +19,8 @@ from dataset.lm_dataset import PretrainDataset
 
 warnings.filterwarnings('ignore')
 
-from transformers import AutoTokenizer
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+# import os
+# os.environ["HF_HUB_OFFLINE"] = "1"
 
 
 def Logger(content):
@@ -33,8 +33,7 @@ def get_lr(current_step, total_steps, lr):
 
 
 def init_pretrain_model(args):
-    tokenizer = AutoTokenizer.from_pretrained('./model/')
-    ckp = f'/home/yuhang/out/pretrain_768.pth'
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
 
     model = MiniMindForCausalLM(MiniMindConfig(
         hidden_size=args.hidden_size,
@@ -42,6 +41,7 @@ def init_pretrain_model(args):
         use_moe=args.use_moe
     ))
 
+    ckp = os.path.join(args.save_dir, "pretrained_model.pth")  # Define the checkpoint path
     model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
 
     print(f'MiniMind模型参数量: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M(illion)')
@@ -189,18 +189,18 @@ def init_distributed_mode():
 # torchrun --nproc_per_node 2 1-pretrain.py
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
-    parser.add_argument("--out_dir", type=str, default="../out")
+    parser.add_argument("--out_dir", type=str, default="./out")
     # 若要以最快速度实现zero则epochs设置为1轮；否则应当利用有限的数据训练2~6个epochs。
     parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=6)
     parser.add_argument("--learning_rate", type=float, default=5e-4)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--use_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain-Qwen")
-    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain-Qwen-512")
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--ddp", action="store_true")
-    parser.add_argument("--accumulation_steps", type=int, default=8)
+    parser.add_argument("--accumulation_steps", type=int, default=64)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_iters", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=100)
@@ -208,9 +208,9 @@ if __name__ == "__main__":
     parser.add_argument('--local_rank', type=int, default=-1)
     parser.add_argument('--hidden_size', default=768, type=int)
     parser.add_argument('--num_hidden_layers', default=16, type=int)
-    parser.add_argument('--max_seq_len', default=512, type=int)
+    parser.add_argument('--max_seq_len', default=1024, type=int)
     parser.add_argument('--use_moe', default=False, type=bool)
-    parser.add_argument("--data_path", type=str, default="/data1/yuhang/.cache/pretrain_hq.jsonl")
+    parser.add_argument("--data_path", type=str, default="/home/ytllm/.cache/pretrain_data/")
     parser.add_argument("--use_qwen25_tokenizer", type=bool, default=True)
     args = parser.parse_args()
 
@@ -271,4 +271,6 @@ if __name__ == "__main__":
 
     iter_per_epoch = len(train_loader)
     for epoch in range(args.epochs):
+        if ddp and train_sampler is not None:
+            train_sampler.set_epoch(epoch)  # 让DDP每轮都shuffle
         train_epoch(epoch, wandb)

@@ -143,7 +143,7 @@ def main():
             messages,
             tokenize=False,
             add_generation_prompt=True
-        ) if args.model_mode != 0 else ((tokenizer.bos_token or "") + prompt)
+        ) if args.model_mode != 0 else (tokenizer.bos_token + prompt)
 
         inputs = tokenizer(
             new_prompt,
