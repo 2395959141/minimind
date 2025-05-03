@@ -104,16 +104,17 @@ def test_model_on_prompts(model, tokenizer, device, max_seq_len=80):
             response = tokenizer.decode(generated_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
             print(f"\n[测试] 输入: {prompt}\n[测试] 输出: {response}\n")
     model.train()
+    torch.cuda.empty_cache()  # 显式释放显存
 
 
 def train_epoch(epoch, wandb):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
     for step, (X, Y, loss_mask) in enumerate(train_loader):
-        # # 在每次迭代后添加内存清理
-        # if step % 500 == 0:
-        #     torch.cuda.empty_cache()
-        #     print("内存清理完成")
+        # 在每次迭代后添加内存清理
+        if step % 500 == 0:
+            torch.cuda.empty_cache()
+            print("内存清理完成")
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
