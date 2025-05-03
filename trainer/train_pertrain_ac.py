@@ -107,10 +107,20 @@ def test_model_on_prompts(model, tokenizer, device, max_seq_len=80):
     torch.cuda.empty_cache()  # 显式释放显存
 
 
-def train_epoch(epoch, wandb):
+def train_epoch(epoch, wandb, start_step=0):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
+    # 获取真实的全局step基础值
+    global_step_base = args.current_step
+    # 获取WandB步数基础值
+    wandb_step_base = args.wandb_step
+    
     for step, (X, Y, loss_mask) in enumerate(train_loader):
+        if step < start_step:
+            continue
+        # 计算当前真实的全局step
+        global_step = global_step_base + step
+        
         # 在每次迭代后添加内存清理
         if step % 500 == 0:
             torch.cuda.empty_cache()
@@ -119,7 +129,7 @@ def train_epoch(epoch, wandb):
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
 
-        lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
+        lr = get_lr(global_step, args.original_total_steps, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
@@ -147,21 +157,24 @@ def train_epoch(epoch, wandb):
         if step % args.log_interval == 0:
             spend_time = time.time() - start_time
             Logger(
-                'Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.12f} epoch_Time:{}min:'.format(
+                'Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.12f} epoch_Time:{}min: global_step:{}'.format(
                     epoch + 1,
                     args.epochs,
                     step,
                     iter_per_epoch,
                     loss.item() * args.accumulation_steps,
                     optimizer.param_groups[-1]['lr'],
-                    spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60))
+                    spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60,
+                    global_step))
 
             if (wandb is not None) and (not ddp or dist.get_rank() == 0):
+                # 计算WandB的step，每100个训练步骤记录一次
+                current_wandb_step = wandb_step_base + global_step // 100
                 wandb.log({
-                    "训练损失": loss.item() * args.accumulation_steps,
-                    "学习率": optimizer.param_groups[-1]['lr'],
-                    "每轮训练时间(分钟)": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60
-                }, step=epoch * iter_per_epoch + step)  
+                    "loss": loss.item() * args.accumulation_steps,
+                    "lr": optimizer.param_groups[-1]['lr'],
+                    "实际步数": global_step
+                }, step=current_wandb_step)
 
         # 新增：每1000 step进行一次模型测试
         if (step + 1) % 5000 == 0 and (not ddp or dist.get_rank() == 0):
@@ -178,8 +191,17 @@ def train_epoch(epoch, wandb):
             else:
                 state_dict = model.state_dict()
 
-            state_dict = {k: v.half() for k, v in state_dict.items()}  # 半精度保存
-            torch.save(state_dict, ckp)
+            # 关键修改：保存当前完成的step和wandb_step
+            checkpoint = {
+                'model_state_dict': {k: v.half() for k, v in state_dict.items()},
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
+                'current_step': global_step + 1,
+                'original_total_steps': args.original_total_steps,
+                'wandb_run_id': wandb.run.id if wandb else None,
+                'wandb_step': wandb_step_base + global_step // 100
+            }
+            torch.save(checkpoint, ckp)
             model.train()
 
 
@@ -190,20 +212,51 @@ def init_model(lm_config, args):
         tokenizer = AutoTokenizer.from_pretrained('./model/')
     model = MiniMindForCausalLM(lm_config).to(args.device)
 
-    # 动态生成检查点路径（指定为 out/pretrain_768.pth）
-    checkpoint_path = os.path.join(args.out_dir, "pretrain_768.pth")
+    # 动态生成检查点路径（与保存路径一致）
+    moe_path = '_moe' if lm_config.use_moe else ''
+    checkpoint_path = os.path.join(args.save_dir, f"pretrain_{lm_config.hidden_size}{moe_path}.pth")
     
     if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=args.device)
-        # 检查检查点是否包含 'model_state_dict' 键
+        checkpoint = torch.load(checkpoint_path)
+        
+        # 如果命令行指定了current_step和wandb_step，则优先使用命令行参数
+        if args.current_step > 0:
+            print(f"使用命令行指定的current_step: {args.current_step}")
+        else:
+            # 否则从检查点加载
+            args.current_step = checkpoint.get('current_step', 0)
+            print(f"从检查点加载current_step: {args.current_step}")
+            
+        if args.wandb_step > 0:
+            print(f"使用命令行指定的wandb_step: {args.wandb_step}")
+        else:
+            # 否则从检查点加载
+            args.wandb_step = checkpoint.get('wandb_step', 0)
+            print(f"从检查点加载wandb_step: {args.wandb_step}")
+            
+        # 从检查点中恢复wandb运行ID
+        if 'wandb_run_id' in checkpoint and checkpoint['wandb_run_id'] is not None:
+            args.resume_id = checkpoint['wandb_run_id']
+            print(f"从检查点恢复WandB运行ID: {args.resume_id}")
+
+        # 恢复原始总步数
+        args.original_total_steps = checkpoint.get('original_total_steps', args.epochs * iter_per_epoch)
+
+        # 加载模型参数
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            # 如果检查点直接保存了 state_dict，直接加载
-            model.load_state_dict(checkpoint)
-        print(f"已从检查点恢复模型：{checkpoint_path}")
+        
+        # 加载优化器状态
+        if 'optimizer_state_dict' in checkpoint and optimizer is not None:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # 加载梯度缩放器状态
+        if 'scaler_state_dict' in checkpoint and scaler is not None:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
     else:
         print("未找到检查点，从头开始训练")
+        args.current_step = 0
+        args.wandb_step = 0
 
     # 梯度检查点启用
     if args.use_gc:
@@ -257,6 +310,8 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_ratio", type=float, default=0.1, 
                        help="预热阶段占总训练步数的比例（0.0~1.0）")
     parser.add_argument("--resume_id", type=str, default=None,help="WandB resume run ID")
+    parser.add_argument("--current_step", type=int, default=0,help="WandB resume step")
+    parser.add_argument("--wandb_step", type=int, default=0,help="WandB resume epoch")
     args = parser.parse_args()
 
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=args.use_moe)
@@ -288,24 +343,26 @@ if __name__ == "__main__":
     if args.use_wandb and (not ddp or ddp_local_rank == 0):
         import wandb
         try:
-            existing_run_id = args.resume_id
-            wandb.init(
+            # 自动恢复运行
+            run = wandb.init(
                 project=args.wandb_project,
-                name=args.wandb_run_name,
-                resume=True,
-                id=existing_run_id,
+                id=args.resume_id,
+                resume="allow",
                 config=args,
                 settings=wandb.Settings(start_method="fork")
             )
-            # 设置自定义图表配置
-            wandb.define_metric("训练损失", summary="min")
-            wandb.define_metric("学习率", summary="last")
+            
+            # 如果已经从命令行指定了wandb_step，则使用指定的值
+            if args.wandb_step > 0:
+                run.step = args.wandb_step
+                print(f"已设置WandB步数为命令行指定的值: {args.wandb_step}")
+            # 否则尝试从恢复的运行中获取步数
+            elif run.resumed:
+                print(f"已恢复WandB运行，最新步数: {run.step}")
+                args.wandb_step = run.step
         except Exception as e:
-            print(f"WandB恢复失败：{e}")
-            wandb.init(project=args.wandb_project, name=args.wandb_run_name)  # 创建新运行
-            # 设置自定义图表配置
-            wandb.define_metric("训练损失", summary="min")
-            wandb.define_metric("学习率", summary="last")
+            print(f"WandB初始化失败: {e}")
+            wandb = None
     else:
         wandb = None
 
@@ -332,11 +389,22 @@ if __name__ == "__main__":
         model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
 
     iter_per_epoch = len(train_loader)
-    start_epoch = 1  # 根据实际情况调整
-    start_step = 38500
-    current_step = start_step
-
-    for epoch in range(start_epoch, args.epochs + 1):
+    
+    # 根据加载的检查点确定起始epoch和step
+    if hasattr(args, 'current_step'):
+        # 计算起始epoch和step
+        start_epoch = args.current_step // iter_per_epoch 
+        start_step = args.current_step % iter_per_epoch
+        print(f"从检查点恢复训练：起始epoch={start_epoch}，起始step={start_step}，总step={args.current_step}")
+    else:
+        start_epoch = 0
+        start_step = 0
+        args.current_step = 0
+        print("从头开始训练")
+    
+    # 修改训练循环
+    for epoch in range(start_epoch, args.epochs):
         if ddp and train_sampler is not None:
-            train_sampler.set_epoch(epoch - 1)  # 让DDP每轮都shuffle
-        train_epoch(epoch - 1, wandb)
+            train_sampler.set_epoch(epoch)
+        # 传递当前起始step
+        train_epoch(epoch, wandb, start_step=start_step if epoch == start_epoch else 0)
