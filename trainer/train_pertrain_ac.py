@@ -29,7 +29,18 @@ def Logger(content):
 
 
 def get_lr(current_step, total_steps, lr):
-    return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
+    # 修改后的预先退火策略（线性预热+余弦退火）
+    warmup_ratio = args.warmup_ratio  # 新增预热比例参数
+    warmup_steps = int(total_steps * warmup_ratio)
+    
+    if current_step < warmup_steps:
+        # 线性预热阶段
+        return lr * (current_step + 1) / warmup_steps
+    else:
+        # 余弦退火阶段
+        decay_steps = total_steps - warmup_steps
+        decay_ratio = (current_step - warmup_steps) / decay_steps
+        return lr * (math.cos(math.pi * decay_ratio) + 1) * 0.5
 
 
 def init_pretrain_model(args):
@@ -48,16 +59,13 @@ def init_pretrain_model(args):
     return model.eval().to(args.device), tokenizer
 
 
-
-
 def test_model_on_prompts(model, tokenizer, device, max_seq_len=80):
     prompts = [
         '马克思主义基本原理',
         '人类大脑的主要功能',
-        '万有引力原理是',
-        '世界上最高的山峰是',
+        '万有引力定律是',
+        '世界上最高的山是',
     ]
-    # init_pretrain_model(args)  # 建议删除
     model.eval()
     # 关键修正：兼容 DDP
     if hasattr(model, "module"):
@@ -65,9 +73,14 @@ def test_model_on_prompts(model, tokenizer, device, max_seq_len=80):
     else:
         gen_model = model
     for prompt in prompts:
-        input_text = (tokenizer.bos_token or "") + prompt
+        messages = [{"role": "user", "content": prompt}]
+        new_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
         inputs = tokenizer(
-            input_text,
+            new_prompt,
             return_tensors="pt",
             truncation=True
         ).to(device)
@@ -97,6 +110,10 @@ def train_epoch(epoch, wandb):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
     for step, (X, Y, loss_mask) in enumerate(train_loader):
+        # # 在每次迭代后添加内存清理
+        # if step % 500 == 0:
+        #     torch.cuda.empty_cache()
+        #     print("内存清理完成")
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
@@ -139,9 +156,11 @@ def train_epoch(epoch, wandb):
                     spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60))
 
             if (wandb is not None) and (not ddp or dist.get_rank() == 0):
-                wandb.log({"loss": loss.item() * args.accumulation_steps,
-                           "lr": optimizer.param_groups[-1]['lr'],
-                           "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
+                wandb.log({
+                    "训练损失": loss.item() * args.accumulation_steps,
+                    "学习率": optimizer.param_groups[-1]['lr'],
+                    "每轮训练时间(分钟)": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60
+                }, step=epoch * iter_per_epoch + step)  
 
         # 新增：每1000 step进行一次模型测试
         if (step + 1) % 5000 == 0 and (not ddp or dist.get_rank() == 0):
@@ -169,6 +188,27 @@ def init_model(lm_config, args):
     else:
         tokenizer = AutoTokenizer.from_pretrained('./model/')
     model = MiniMindForCausalLM(lm_config).to(args.device)
+
+    # 动态生成检查点路径（指定为 out/pretrain_768.pth）
+    checkpoint_path = os.path.join(args.out_dir, "pretrain_768.pth")
+    
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=args.device)
+        # 检查检查点是否包含 'model_state_dict' 键
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            # 如果检查点直接保存了 state_dict，直接加载
+            model.load_state_dict(checkpoint)
+        print(f"已从检查点恢复模型：{checkpoint_path}")
+    else:
+        print("未找到检查点，从头开始训练")
+
+    # 梯度检查点启用
+    if args.use_gc:
+        model.gradient_checkpointing_enable()
+        if not ddp or dist.get_rank() == 0:
+            print(f"[优化] 已启用梯度检查点，预计节省显存：{lm_config.hidden_size//1000}GB左右")
     print("词嵌入维度", model.config.vocab_size)
     Logger(f'LLM可训练总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     return model, tokenizer
@@ -197,10 +237,10 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--use_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain-Qwen-512")
+    parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain-minimind-1024")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--ddp", action="store_true")
-    parser.add_argument("--accumulation_steps", type=int, default=64)
+    parser.add_argument("--accumulation_steps", type=int, default=12)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_iters", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=100)
@@ -212,6 +252,10 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=False, type=bool)
     parser.add_argument("--data_path", type=str, default="/home/ytllm/.cache/pretrain_data/")
     parser.add_argument("--use_qwen25_tokenizer", type=bool, default=True)
+    parser.add_argument("--use_gc", type=bool, default=False)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1, 
+                       help="预热阶段占总训练步数的比例（0.0~1.0）")
+    parser.add_argument("--resume_id", type=str, default=None,help="WandB resume run ID")
     args = parser.parse_args()
 
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=args.use_moe)
@@ -221,7 +265,7 @@ if __name__ == "__main__":
     tokens_per_iter = args.batch_size * args.max_seq_len
     device_type = "cuda" if "cuda" in args.device else "cpu"
 
-    args.wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+    args.wandb_run_name = f"MiniMind-h{args.hidden_size}-l{args.num_hidden_layers}-bs{args.batch_size}-lr{args.learning_rate}"
 
     ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast()
 
@@ -242,8 +286,25 @@ if __name__ == "__main__":
 
     if args.use_wandb and (not ddp or ddp_local_rank == 0):
         import wandb
-
-        wandb.init(project=args.wandb_project, name=args.wandb_run_name)
+        try:
+            existing_run_id = args.resume_id
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                resume=True,
+                id=existing_run_id,
+                config=args,
+                settings=wandb.Settings(start_method="fork")
+            )
+            # 设置自定义图表配置
+            wandb.define_metric("训练损失", summary="min")
+            wandb.define_metric("学习率", summary="last")
+        except Exception as e:
+            print(f"WandB恢复失败：{e}")
+            wandb.init(project=args.wandb_project, name=args.wandb_run_name)  # 创建新运行
+            # 设置自定义图表配置
+            wandb.define_metric("训练损失", summary="min")
+            wandb.define_metric("学习率", summary="last")
     else:
         wandb = None
 
@@ -270,7 +331,11 @@ if __name__ == "__main__":
         model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
 
     iter_per_epoch = len(train_loader)
-    for epoch in range(args.epochs):
+    start_epoch = 1  # 根据实际情况调整
+    start_step = 38500
+    current_step = start_step
+
+    for epoch in range(start_epoch, args.epochs + 1):
         if ddp and train_sampler is not None:
-            train_sampler.set_epoch(epoch)  # 让DDP每轮都shuffle
-        train_epoch(epoch, wandb)
+            train_sampler.set_epoch(epoch - 1)  # 让DDP每轮都shuffle
+        train_epoch(epoch - 1, wandb)
