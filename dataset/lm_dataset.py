@@ -26,6 +26,14 @@ class PretrainDataset(Dataset):
         self.eos_token_id = tokenizer.convert_tokens_to_ids(self.eos_token)
         self.pad_token_id = tokenizer.convert_tokens_to_ids(self.pad_token)
         self.dataset = self.load_data(data_path)
+        print(f"数据路径: {data_path}")
+        print(f"文件列表: {os.listdir(data_path)}")
+        # 尝试读取文件内容
+        try:
+            with open(os.path.join(data_path, "data-00000-of-00001.arrow"), "rb") as f:
+                print(f"文件头: {f.read(100)}")  # 打印文件头部内容
+        except Exception as e:
+            print(f"读取文件失败: {e}")
 
     def load_data(self, data_path):
         # 直接从预处理好的数据集加载

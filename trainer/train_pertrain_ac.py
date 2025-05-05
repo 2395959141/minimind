@@ -34,8 +34,10 @@ def get_lr(current_step, total_steps, lr):
     warmup_steps = int(total_steps * warmup_ratio)
     
     if current_step < warmup_steps:
-        # 线性预热阶段
-        return lr * (current_step + 1) / warmup_steps
+        # 修改预热阶段：初始学习率为lr的十分之一
+        initial_lr = lr * 0.1  # 初始学习率设为目标学习率的十分之一
+        # 线性增长到目标学习率
+        return initial_lr + (lr - initial_lr) * (current_step / warmup_steps)
     else:
         # 余弦退火阶段
         decay_steps = total_steps - warmup_steps
@@ -59,7 +61,7 @@ def init_pretrain_model(args):
     return model.eval().to(args.device), tokenizer
 
 
-def test_model_on_prompts(model, tokenizer, device, max_seq_len=80):
+def test_model_on_prompts(model, tokenizer, device, max_seq_len=80, wandb=None):
     prompts = [
         '马克思主义基本原理',
         '人类大脑的主要功能',
@@ -72,6 +74,9 @@ def test_model_on_prompts(model, tokenizer, device, max_seq_len=80):
         gen_model = model.module
     else:
         gen_model = model
+    
+    test_results = {}  # 新增：存储测试结果
+    
     for prompt in prompts:
         messages = [{"role": "user", "content": prompt}]
         new_prompt = tokenizer.apply_chat_template(
@@ -103,6 +108,11 @@ def test_model_on_prompts(model, tokenizer, device, max_seq_len=80):
             )
             response = tokenizer.decode(generated_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
             print(f"\n[测试] 输入: {prompt}\n[测试] 输出: {response}\n")
+            test_results[f"测试/输入_{prompt[:10]}"] = response  # 记录测试结果
+    
+    if wandb is not None:  # 新增：将测试结果记录到WandB
+        wandb.log(test_results)
+    
     model.train()
     torch.cuda.empty_cache()  # 显式释放显存
 
@@ -179,12 +189,15 @@ def train_epoch(epoch, wandb, start_step=0):
         # 新增：每1000 step进行一次模型测试
         if (step + 1) % 5000 == 0 and (not ddp or dist.get_rank() == 0):
             print(f"\n[测试] 当前step: {step+1}，进行模型推理测试：")
-            test_model_on_prompts(model, tokenizer, args.device, max_seq_len=80)
+            test_model_on_prompts(model, tokenizer, args.device, max_seq_len=80, wandb=wandb)
 
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
             model.eval()
             moe_path = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth'
+            # 新增时间戳作为唯一标识
+            timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+            # 修改保存路径格式，包含时间戳和隐藏层大小
+            ckp = f'{args.save_dir}/pretrain_h{lm_config.hidden_size}{moe_path}_{timestamp}.pth'
 
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
@@ -204,6 +217,10 @@ def train_epoch(epoch, wandb, start_step=0):
             torch.save(checkpoint, ckp)
             model.train()
 
+    # 在训练循环结束后添加最终保存逻辑（可选）
+    if (not ddp or dist.get_rank() == 0) and (step + 1) == len(train_loader):
+        save_checkpoint(model, optimizer, scaler, args, lm_config, is_final=True)
+
 
 def init_model(lm_config, args):
     if args.use_qwen25_tokenizer:
@@ -219,40 +236,32 @@ def init_model(lm_config, args):
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path)
         
-        # 如果命令行指定了current_step和wandb_step，则优先使用命令行参数
-        if args.current_step > 0:
-            print(f"使用命令行指定的current_step: {args.current_step}")
-        else:
-            # 否则从检查点加载
+        # 新增恢复模式判断
+        if args.resume_training:
+            # 恢复原有训练进度
             args.current_step = checkpoint.get('current_step', 0)
-            print(f"从检查点加载current_step: {args.current_step}")
-            
-        if args.wandb_step > 0:
-            print(f"使用命令行指定的wandb_step: {args.wandb_step}")
-        else:
-            # 否则从检查点加载
             args.wandb_step = checkpoint.get('wandb_step', 0)
-            print(f"从检查点加载wandb_step: {args.wandb_step}")
+            args.original_total_steps = checkpoint.get('original_total_steps', args.epochs * iter_per_epoch)
             
-        # 从检查点中恢复wandb运行ID
-        if 'wandb_run_id' in checkpoint and checkpoint['wandb_run_id'] is not None:
-            args.resume_id = checkpoint['wandb_run_id']
-            print(f"从检查点恢复WandB运行ID: {args.resume_id}")
-
-        # 恢复原始总步数
-        args.original_total_steps = checkpoint.get('original_total_steps', args.epochs * iter_per_epoch)
-
-        # 加载模型参数
+            # 恢复优化器状态
+            if 'optimizer_state_dict' in checkpoint and optimizer is not None:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # 恢复梯度缩放器状态
+            if 'scaler_state_dict' in checkpoint and scaler is not None:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            
+            print(f"恢复训练：当前步数{args.current_step}，总步数{args.original_total_steps}")
+        else:
+            # 重新开始训练设置
+            args.current_step = 0
+            args.wandb_step = 0
+            args.original_total_steps = args.epochs * iter_per_epoch
+            print("加载模型权重但重新开始训练")
+        
+        # 加载模型参数（无论哪种模式都需要加载）
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
-        
-        # 加载优化器状态
-        if 'optimizer_state_dict' in checkpoint and optimizer is not None:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
-        # 加载梯度缩放器状态
-        if 'scaler_state_dict' in checkpoint and scaler is not None:
-            scaler.load_state_dict(checkpoint['scaler_state_dict'])
     else:
         print("未找到检查点，从头开始训练")
         args.current_step = 0
@@ -280,6 +289,26 @@ def init_distributed_mode():
     torch.cuda.set_device(DEVICE)
 
 
+def save_checkpoint(model, optimizer, scaler, args, lm_config, is_final=False):
+    """统一的检查点保存函数"""
+    model.eval()
+    moe_path = '_moe' if lm_config.use_moe else ''
+    
+    # 生成基础文件名
+    base_name = f'pretrain_h{lm_config.hidden_size}{moe_path}'
+    
+    # 最终保存时添加时间戳
+    if is_final:
+        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        ckp = f'{args.save_dir}/{base_name}_final_{timestamp}.pth'
+    else:
+        # 训练过程中使用固定名称
+        ckp = f'{args.save_dir}/{base_name}_latest.pth'
+    
+    # ... 保存逻辑保持不变 ...
+    model.train()
+
+
 # torchrun --nproc_per_node 2 1-pretrain.py
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
@@ -287,7 +316,7 @@ if __name__ == "__main__":
     # 若要以最快速度实现zero则epochs设置为1轮；否则应当利用有限的数据训练2~6个epochs。
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=6)
-    parser.add_argument("--learning_rate", type=float, default=5e-4)
+    parser.add_argument("--learning_rate", type=float, default=4e-4)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--use_wandb", action="store_true")
@@ -312,6 +341,8 @@ if __name__ == "__main__":
     parser.add_argument("--resume_id", type=str, default=None,help="WandB resume run ID")
     parser.add_argument("--current_step", type=int, default=0,help="WandB resume step")
     parser.add_argument("--wandb_step", type=int, default=0,help="WandB resume epoch")
+    parser.add_argument("--resume_training", action="store_true",
+                       help="是否从检查点恢复训练进度（包括学习率、优化器状态等）")
     args = parser.parse_args()
 
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=args.use_moe)
@@ -366,9 +397,8 @@ if __name__ == "__main__":
     else:
         wandb = None
 
-    model, tokenizer = init_model(lm_config, args)
-    ## ! 使用torch.compile进行加速
-    # model = torch.compile(model, mode="reduce-overhead")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+    # 在调用init_model之前创建train_loader并计算iter_per_epoch
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if ddp else None
     train_loader = DataLoader(
@@ -381,6 +411,11 @@ if __name__ == "__main__":
         sampler=train_sampler
     )
 
+    iter_per_epoch = len(train_loader)  # 先计算iter_per_epoch
+
+    # 现在可以调用init_model
+    model, tokenizer = init_model(lm_config, args)
+
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
@@ -389,6 +424,11 @@ if __name__ == "__main__":
         model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
 
     iter_per_epoch = len(train_loader)
+    
+    # 确保original_total_steps有值
+    if not hasattr(args, 'original_total_steps'):
+        args.original_total_steps = args.epochs * iter_per_epoch
+        print(f"从头开始训练，设置总步数为: {args.original_total_steps}")
     
     # 根据加载的检查点确定起始epoch和step
     if hasattr(args, 'current_step'):
@@ -401,6 +441,17 @@ if __name__ == "__main__":
         start_step = 0
         args.current_step = 0
         print("从头开始训练")
+    
+    # 在训练循环开始前添加初始化保存
+    if (not ddp or dist.get_rank() == 0):
+        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        init_ckp = f'{args.save_dir}/pretrain_init_{timestamp}.pth'
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'init_time': timestamp,
+            'config': lm_config.__dict__
+        }, init_ckp)
+        print(f"已保存初始化模型到: {init_ckp}")
     
     # 修改训练循环
     for epoch in range(start_epoch, args.epochs):
